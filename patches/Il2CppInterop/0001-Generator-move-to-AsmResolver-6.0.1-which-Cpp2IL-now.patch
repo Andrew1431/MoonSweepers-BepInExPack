@@ -1,0 +1,796 @@
+From 578e2acb1f3f650940fbe0ac9b60cb070303d65a Mon Sep 17 00:00:00 2001
+From: Andrew Hartwig <andrew.hartwig1@gmail.com>
+Date: Fri, 6 Nov 2026 12:47:34 -0500
+Subject: [PATCH 1/2] Generator: move to AsmResolver 6.0.1, which Cpp2IL now
+ uses
+
+---
+ .../Contexts/AssemblyRewriteContext.cs        |  6 +-
+ .../Contexts/MethodRewriteContext.cs          |  8 +--
+ .../Contexts/RewriteGlobalContext.cs          |  6 +-
+ .../Contexts/TypeRewriteContext.cs            |  6 +-
+ .../Extensions/AsmResolver6Compat.cs          | 70 +++++++++++++++++++
+ .../Extensions/ILGeneratorEx.cs               |  8 +--
+ .../Extensions/TypeReferenceEx.cs             |  2 +-
+ .../Il2CppInterop.Generator.csproj            |  2 +-
+ .../MetadataAccess/AssemblyMetadataAccess.cs  |  8 +--
+ .../MetadataAccess/Il2CppAssemblyResolver.cs  | 30 ++++----
+ .../Pass20GenerateStaticConstructors.cs       |  6 +-
+ .../Pass23GeneratePointerConstructors.cs      |  4 +-
+ ...nerateNonBlittableValueTypeDefaultCtors.cs |  4 +-
+ ...0GenerateGenericMethodStoreConstructors.cs |  4 +-
+ .../Passes/Pass60AddImplicitConversions.cs    | 20 +++---
+ .../Passes/Pass61ImplementAwaiters.cs         |  4 +-
+ .../Passes/Pass80UnstripMethods.cs            |  4 +-
+ .../Utils/CorlibReferences.cs                 | 10 +--
+ .../Utils/MethodSignatureCreator.cs           |  4 +-
+ .../Utils/ReferenceCreator.cs                 |  6 +-
+ .../Utils/RuntimeAssemblyReferences.cs        | 20 +++---
+ .../Utils/UnstripGenerator.cs                 |  4 +-
+ .../Utils/UnstripTranslator.cs                |  4 +-
+ 23 files changed, 153 insertions(+), 87 deletions(-)
+ create mode 100644 Il2CppInterop.Generator/Extensions/AsmResolver6Compat.cs
+
+diff --git a/Il2CppInterop.Generator/Contexts/AssemblyRewriteContext.cs b/Il2CppInterop.Generator/Contexts/AssemblyRewriteContext.cs
+index a5e8f2f..d1e652d 100644
+--- a/Il2CppInterop.Generator/Contexts/AssemblyRewriteContext.cs
++++ b/Il2CppInterop.Generator/Contexts/AssemblyRewriteContext.cs
+@@ -86,9 +86,9 @@ public class AssemblyRewriteContext
+ 
+             var convertedElementType = RewriteTypeRef(elementType);
+             if (elementType is GenericParameterSignature)
+-                return new GenericInstanceTypeSignature(Imports.Il2CppArrayBase.ToTypeDefOrRef(), false, convertedElementType);
++                return Sigs.GenericInst(Imports.Il2CppArrayBase.ToTypeDefOrRef(), false, convertedElementType);
+ 
+-            return new GenericInstanceTypeSignature(convertedElementType.IsValueType()
++            return Sigs.GenericInst(convertedElementType.IsValueType()
+                     ? Imports.Il2CppStructArray.ToTypeDefOrRef()
+                     : Imports.Il2CppReferenceArray.ToTypeDefOrRef(), false, convertedElementType);
+         }
+@@ -107,7 +107,7 @@ public class AssemblyRewriteContext
+         if (typeRef is GenericInstanceTypeSignature genericInstance)
+         {
+             var genericType = RewriteTypeRef(genericInstance.GenericType.ToTypeSignature()).ToTypeDefOrRef();
+-            var newRef = new GenericInstanceTypeSignature(genericType, genericType.IsValueType());
++            var newRef = Sigs.GenericInst(genericType, genericType.IsValueType());
+             foreach (var originalParameter in genericInstance.TypeArguments)
+                 newRef.TypeArguments.Add(RewriteTypeRef(originalParameter));
+ 
+diff --git a/Il2CppInterop.Generator/Contexts/MethodRewriteContext.cs b/Il2CppInterop.Generator/Contexts/MethodRewriteContext.cs
+index efdcd85..62d3425 100644
+--- a/Il2CppInterop.Generator/Contexts/MethodRewriteContext.cs
++++ b/Il2CppInterop.Generator/Contexts/MethodRewriteContext.cs
+@@ -55,8 +55,8 @@ public class MethodRewriteContext
+ 
+         var newAttributes = AdjustAttributes(originalMethod.Attributes, originalMethod.Name == "Finalize");
+         var newSignature = (newAttributes & MethodAttributes.Static) != 0
+-            ? MethodSignature.CreateStatic(declaringType.AssemblyContext.Imports.Module.Void(), originalMethod.GenericParameters.Count)
+-            : MethodSignature.CreateInstance(declaringType.AssemblyContext.Imports.Module.Void(), originalMethod.GenericParameters.Count);
++            ? Sigs.Static(declaringType.AssemblyContext.Imports.Module.Void(), originalMethod.GenericParameters.Count)
++            : Sigs.Instance(declaringType.AssemblyContext.Imports.Module.Void(), originalMethod.GenericParameters.Count);
+         var newMethod = new MethodDefinition("", newAttributes, newSignature);
+         newMethod.CilMethodBody = new();
+         NewMethod = newMethod;
+@@ -129,8 +129,8 @@ public class MethodRewriteContext
+             DeclaringType.NewType.NestedTypes.Add(genericMethodInfoStoreType);
+             GenericInstantiationsStore = genericMethodInfoStoreType;
+ 
+-            var selfSubstRef = new GenericInstanceTypeSignature(genericMethodInfoStoreType, false);
+-            var selfSubstMethodRef = new GenericInstanceTypeSignature(genericMethodInfoStoreType, false);
++            var selfSubstRef = Sigs.GenericInst(genericMethodInfoStoreType, false);
++            var selfSubstMethodRef = Sigs.GenericInst(genericMethodInfoStoreType, false);
+ 
+             for (var index = 0; index < genericParams.Count; index++)
+             {
+diff --git a/Il2CppInterop.Generator/Contexts/RewriteGlobalContext.cs b/Il2CppInterop.Generator/Contexts/RewriteGlobalContext.cs
+index 76c1ea2..bc8f8d6 100644
+--- a/Il2CppInterop.Generator/Contexts/RewriteGlobalContext.cs
++++ b/Il2CppInterop.Generator/Contexts/RewriteGlobalContext.cs
+@@ -28,7 +28,7 @@ public class RewriteGlobalContext : IDisposable
+         GameAssemblies = gameAssemblies;
+         UnityAssemblies = unityAssemblies;
+ 
+-        Il2CppAssemblyResolver assemblyResolver = new();
++        var newAssemblyContext = Il2CppAssemblyResolver.NewContext(CorlibReferences.TargetCorlib);
+ 
+         foreach (var sourceAssembly in gameAssemblies.Assemblies)
+         {
+@@ -41,9 +41,7 @@ public class RewriteGlobalContext : IDisposable
+             var newAssembly = new AssemblyDefinition(sourceAssembly.Name.UnSystemify(options), sourceAssembly.Version);
+             var newModule = new ModuleDefinition(sourceAssembly.ManifestModule?.Name.UnSystemify(options), CorlibReferences.TargetCorlib);
+             newAssembly.Modules.Add(newModule);
+-
+-            newModule.MetadataResolver = new DefaultMetadataResolver(assemblyResolver);
+-            assemblyResolver.AddToCache(newAssembly);
++            newAssemblyContext.AddAssembly(newAssembly);
+ 
+             var assemblyRewriteContext = new AssemblyRewriteContext(this, sourceAssembly, newAssembly);
+             AddAssemblyContext(assemblyName, assemblyRewriteContext);
+diff --git a/Il2CppInterop.Generator/Contexts/TypeRewriteContext.cs b/Il2CppInterop.Generator/Contexts/TypeRewriteContext.cs
+index 23b9e8b..c442a97 100644
+--- a/Il2CppInterop.Generator/Contexts/TypeRewriteContext.cs
++++ b/Il2CppInterop.Generator/Contexts/TypeRewriteContext.cs
+@@ -69,11 +69,11 @@ public class TypeRewriteContext
+     {
+         if (NewType.HasGenericParameters())
+         {
+-            var genericInstanceType = new GenericInstanceTypeSignature(NewType, NewType.IsValueType());
++            var genericInstanceType = Sigs.GenericInst(NewType, NewType.IsValueType());
+             foreach (var newTypeGenericParameter in NewType.GenericParameters)
+                 genericInstanceType.TypeArguments.Add(newTypeGenericParameter.ToTypeSignature());
+             SelfSubstitutedRef = NewType.DeclaringModule!.DefaultImporter.ImportTypeSignature(genericInstanceType).ToTypeDefOrRef();
+-            var genericTypeRef = new GenericInstanceTypeSignature(
++            var genericTypeRef = Sigs.GenericInst(
+                 AssemblyContext.Imports.Il2CppClassPointerStore.ToTypeDefOrRef(),
+                 AssemblyContext.Imports.Il2CppClassPointerStore.IsValueType(),
+                 SelfSubstitutedRef.ToTypeSignature());
+@@ -83,7 +83,7 @@ public class TypeRewriteContext
+         else
+         {
+             SelfSubstitutedRef = NewType;
+-            var genericTypeRef = new GenericInstanceTypeSignature(
++            var genericTypeRef = Sigs.GenericInst(
+                 AssemblyContext.Imports.Il2CppClassPointerStore.ToTypeDefOrRef(),
+                 AssemblyContext.Imports.Il2CppClassPointerStore.IsValueType());
+             if (OriginalType.ToTypeSignature().IsPrimitive() || OriginalType.FullName == "System.String")
+diff --git a/Il2CppInterop.Generator/Extensions/AsmResolver6Compat.cs b/Il2CppInterop.Generator/Extensions/AsmResolver6Compat.cs
+new file mode 100644
+index 0000000..9e69433
+--- /dev/null
++++ b/Il2CppInterop.Generator/Extensions/AsmResolver6Compat.cs
+@@ -0,0 +1,70 @@
++global using Il2CppInterop.Generator.Extensions.AsmResolver6;
++
++using AsmResolver.DotNet;
++using AsmResolver.DotNet.Signatures;
++
++namespace Il2CppInterop.Generator.Extensions.AsmResolver6;
++
++// AsmResolver 6 moved resolution onto an explicit RuntimeContext and dropped the params overloads the generator uses.
++// Each descriptor's own module knows its context (Cpp2IL's assemblies arrive with one), and old call sites keep working.
++internal static class AsmResolver6Compat
++{
++    private static RuntimeContext? ContextOf(IMemberDescriptor member) => member.ContextModule?.RuntimeContext;
++
++    public static TypeDefinition? Resolve(this ITypeDescriptor type)
++        => type.Resolve(ContextOf(type), out var definition) == ResolutionStatus.Success ? definition : null;
++
++    public static MethodDefinition? Resolve(this IMethodDescriptor method)
++        => method.Resolve(ContextOf(method), out var definition) == ResolutionStatus.Success ? definition : null;
++
++    public static FieldDefinition? Resolve(this IFieldDescriptor field)
++        => field.Resolve(ContextOf(field), out var definition) == ResolutionStatus.Success ? definition : null;
++
++    public static IMemberDefinition? Resolve(this MemberReference member)
++        => ((IMemberDescriptor)member).Resolve(ContextOf(member), out var definition) == ResolutionStatus.Success ? definition : null;
++
++    public static bool IsValueTypeOrFalse(this ITypeDescriptor type) => type.TryGetIsValueType(ContextOf(type)) ?? false;
++
++    public static TypeSignature ToTypeSignature(this ITypeDescriptor type) => type switch
++    {
++        TypeSignature signature => signature,
++        ITypeDefOrRef typeDefOrRef => typeDefOrRef.ToTypeSignature(typeDefOrRef.IsValueTypeOrFalse()),
++        _ => type.ToTypeSignature(ContextOf(type)),
++    };
++
++    public static GenericInstanceTypeSignature MakeGenericInstanceType(this ITypeDescriptor type, params TypeSignature[] typeArguments)
++        => new(type.ToTypeDefOrRef(), type.IsValueTypeOrFalse(), typeArguments);
++
++    public static MethodSpecification MakeGenericInstanceMethod(this IMethodDefOrRef method, params TypeSignature[] typeArguments)
++        => method.MakeGenericInstanceMethod((IEnumerable<TypeSignature>)typeArguments);
++}
++
++internal static class Sigs
++{
++    public static MethodSignature Static(TypeSignature returnType, params TypeSignature[] parameters)
++        => MethodSignature.CreateStatic(returnType, (IEnumerable<TypeSignature>)parameters);
++
++    public static MethodSignature Static(TypeSignature returnType, IEnumerable<TypeSignature> parameters)
++        => MethodSignature.CreateStatic(returnType, parameters);
++
++    public static MethodSignature Static(TypeSignature returnType, int genericParameters, params TypeSignature[] parameters)
++        => MethodSignature.CreateStatic(returnType, genericParameters, parameters);
++
++    public static MethodSignature Static(TypeSignature returnType, int genericParameters, IEnumerable<TypeSignature> parameters)
++        => MethodSignature.CreateStatic(returnType, genericParameters, parameters);
++
++    public static MethodSignature Instance(TypeSignature returnType, params TypeSignature[] parameters)
++        => MethodSignature.CreateInstance(returnType, (IEnumerable<TypeSignature>)parameters);
++
++    public static MethodSignature Instance(TypeSignature returnType, IEnumerable<TypeSignature> parameters)
++        => MethodSignature.CreateInstance(returnType, parameters);
++
++    public static MethodSignature Instance(TypeSignature returnType, int genericParameters, params TypeSignature[] parameters)
++        => MethodSignature.CreateInstance(returnType, genericParameters, (IEnumerable<TypeSignature>)parameters);
++
++    public static MethodSignature Instance(TypeSignature returnType, int genericParameters, IEnumerable<TypeSignature> parameters)
++        => MethodSignature.CreateInstance(returnType, genericParameters, parameters);
++
++    public static GenericInstanceTypeSignature GenericInst(ITypeDefOrRef genericType, bool isValueType, params TypeSignature[] typeArguments)
++        => new(genericType, isValueType, typeArguments);
++}
+diff --git a/Il2CppInterop.Generator/Extensions/ILGeneratorEx.cs b/Il2CppInterop.Generator/Extensions/ILGeneratorEx.cs
+index 0f9f12f..fcd2943 100644
+--- a/Il2CppInterop.Generator/Extensions/ILGeneratorEx.cs
++++ b/Il2CppInterop.Generator/Extensions/ILGeneratorEx.cs
+@@ -52,7 +52,7 @@ public static class ILGeneratorEx
+                 body.AddLoadArgument(argumentIndex);
+                 body.Add(OpCodes.Call, imports.IL2CPP_Il2CppObjectBaseToPtr.Value);
+                 body.Add(OpCodes.Call, imports.IL2CPP_il2cpp_object_unbox.Value);
+-                var classPointerTypeRef = new GenericInstanceTypeSignature(imports.Il2CppClassPointerStore.ToTypeDefOrRef(), imports.Il2CppClassPointerStore.IsValueType(), newType);
++                var classPointerTypeRef = Sigs.GenericInst(imports.Il2CppClassPointerStore.ToTypeDefOrRef(), imports.Il2CppClassPointerStore.IsValueType(), newType);
+                 var classPointerFieldRef =
+                     ReferenceCreator.CreateFieldReference("NativeClassPtr", imports.Module.IntPtr(), classPointerTypeRef.ToTypeDefOrRef());
+                 body.Add(OpCodes.Ldsfld, enclosingType.NewType.DeclaringModule!.DefaultImporter.ImportField(classPointerFieldRef));
+@@ -322,7 +322,7 @@ public static class ILGeneratorEx
+                 else
+                 {
+                     Debug.Assert(enclosingType.NewType.DeclaringModule is not null);
+-                    var classPointerTypeRef = new GenericInstanceTypeSignature(imports.Il2CppClassPointerStore.ToTypeDefOrRef(), imports.Il2CppClassPointerStore.IsValueType(), convertedReturnType);
++                    var classPointerTypeRef = Sigs.GenericInst(imports.Il2CppClassPointerStore.ToTypeDefOrRef(), imports.Il2CppClassPointerStore.IsValueType(), convertedReturnType);
+                     var classPointerFieldRef =
+                         ReferenceCreator.CreateFieldReference("NativeClassPtr", imports.Module.IntPtr(),
+                             classPointerTypeRef.ToTypeDefOrRef());
+@@ -394,7 +394,7 @@ public static class ILGeneratorEx
+     {
+         Debug.Assert(targetType.DeclaringModule is not null);
+         var method = new MethodDefinition("BoxIl2CppObject", MethodAttributes.Public | MethodAttributes.HideBySig,
+-            MethodSignature.CreateInstance(targetType.DeclaringModule!.DefaultImporter.ImportTypeSignature(il2CppObjectTypeDef)));
++            Sigs.Instance(targetType.DeclaringModule!.DefaultImporter.ImportTypeSignature(il2CppObjectTypeDef)));
+         targetType.Methods.Add(method);
+ 
+         method.CilMethodBody = new CilMethodBody();
+@@ -404,7 +404,7 @@ public static class ILGeneratorEx
+         methodBody.Add(OpCodes.Call, targetType.DeclaringModule.DefaultImporter.ImportMethod(imports.IL2CPP_il2cpp_value_box.Value));
+ 
+         methodBody.Add(OpCodes.Newobj,
+-            new MemberReference(il2CppObjectTypeDef.ToTypeDefOrRef(), ".ctor", MethodSignature.CreateInstance(targetType.DeclaringModule.Void(), targetType.DeclaringModule.IntPtr())));
++            new MemberReference(il2CppObjectTypeDef.ToTypeDefOrRef(), ".ctor", Sigs.Instance(targetType.DeclaringModule.Void(), targetType.DeclaringModule.IntPtr())));
+ 
+         methodBody.Add(OpCodes.Ret);
+     }
+diff --git a/Il2CppInterop.Generator/Extensions/TypeReferenceEx.cs b/Il2CppInterop.Generator/Extensions/TypeReferenceEx.cs
+index 1ce59c5..18146dd 100644
+--- a/Il2CppInterop.Generator/Extensions/TypeReferenceEx.cs
++++ b/Il2CppInterop.Generator/Extensions/TypeReferenceEx.cs
+@@ -53,6 +53,6 @@ public static class TypeReferenceEx
+     // See https://github.com/BepInEx/Il2CppInterop/issues/211 for the discussion
+     public static bool IsValueType(this ITypeDescriptor type)
+     {
+-        return type.IsValueType && type.FullName != "System.Enum";
++        return type.IsValueTypeOrFalse() && type.FullName != "System.Enum";
+     }
+ }
+diff --git a/Il2CppInterop.Generator/Il2CppInterop.Generator.csproj b/Il2CppInterop.Generator/Il2CppInterop.Generator.csproj
+index bab1795..7accabb 100644
+--- a/Il2CppInterop.Generator/Il2CppInterop.Generator.csproj
++++ b/Il2CppInterop.Generator/Il2CppInterop.Generator.csproj
+@@ -13,7 +13,7 @@
+   </PropertyGroup>
+ 
+   <ItemGroup>
+-    <PackageReference Include="AsmResolver.DotNet" Version="6.0.0-beta.5" />
++    <PackageReference Include="AsmResolver.DotNet" Version="6.0.1" />
+     <PackageReference Include="MonoMod.Backports" Version="1.1.2">
+       <Aliases>MonoModBackports</Aliases><!-- Transitive dependency from AsmResolver. Extern alias prevents it from affecting us. -->
+     </PackageReference>
+diff --git a/Il2CppInterop.Generator/MetadataAccess/AssemblyMetadataAccess.cs b/Il2CppInterop.Generator/MetadataAccess/AssemblyMetadataAccess.cs
+index e0cbd10..d6a7e1b 100644
+--- a/Il2CppInterop.Generator/MetadataAccess/AssemblyMetadataAccess.cs
++++ b/Il2CppInterop.Generator/MetadataAccess/AssemblyMetadataAccess.cs
+@@ -5,14 +5,14 @@ namespace Il2CppInterop.Generator.MetadataAccess;
+ 
+ public class AssemblyMetadataAccess : IIl2CppMetadataAccess
+ {
+-    private readonly Il2CppAssemblyResolver myAssemblyResolver = new();
++    private readonly RuntimeContext myContext = Il2CppAssemblyResolver.NewContext();
+     private readonly List<AssemblyDefinition> myAssemblies = new();
+     private readonly Dictionary<string, AssemblyDefinition> myAssembliesByName = new();
+     private readonly Dictionary<(string AssemblyName, string TypeName), TypeDefinition> myTypesByName = new();
+ 
+     public AssemblyMetadataAccess(IEnumerable<string> assemblyPaths)
+     {
+-        Load(assemblyPaths.Select(AssemblyDefinition.FromFile));
++        Load(assemblyPaths.Select(path => myContext.LoadAssembly(path)));
+     }
+ 
+     public AssemblyMetadataAccess(IEnumerable<AssemblyDefinition> assemblies)
+@@ -24,7 +24,6 @@ public class AssemblyMetadataAccess : IIl2CppMetadataAccess
+ 
+     public void Dispose()
+     {
+-        myAssemblyResolver.ClearCache();
+         myAssemblies.Clear();
+         myAssembliesByName.Clear();
+     }
+@@ -62,8 +61,7 @@ public class AssemblyMetadataAccess : IIl2CppMetadataAccess
+         {
+             myAssemblies.Add(sourceAssembly);
+             myAssembliesByName[sourceAssembly.Name!] = sourceAssembly;
+-            sourceAssembly.ManifestModule!.MetadataResolver = new DefaultMetadataResolver(myAssemblyResolver);
+-            myAssemblyResolver.AddToCache(sourceAssembly);
++            if (sourceAssembly.RuntimeContext is null) myContext.AddAssembly(sourceAssembly);
+         }
+ 
+         foreach (var sourceAssembly in myAssemblies)
+diff --git a/Il2CppInterop.Generator/MetadataAccess/Il2CppAssemblyResolver.cs b/Il2CppInterop.Generator/MetadataAccess/Il2CppAssemblyResolver.cs
+index 8874998..cd88cd0 100644
+--- a/Il2CppInterop.Generator/MetadataAccess/Il2CppAssemblyResolver.cs
++++ b/Il2CppInterop.Generator/MetadataAccess/Il2CppAssemblyResolver.cs
+@@ -1,18 +1,18 @@
+ ﻿using AsmResolver.DotNet;
++using AsmResolver.DotNet.Serialized;
+ using AsmResolver.IO;
+ 
+-namespace Il2CppInterop.Generator.MetadataAccess;
+-
+-internal sealed class Il2CppAssemblyResolver : AssemblyResolverBase
+-{
+-    public Il2CppAssemblyResolver() : base(new ByteArrayFileService())
+-    {
+-    }
+-
+-    protected override string? ProbeRuntimeDirectories(AssemblyDescriptor assembly) => null;
+-
+-    public void AddToCache(AssemblyDefinition assembly)
+-    {
+-        AddToCache(assembly, assembly);
+-    }
+-}
++namespace Il2CppInterop.Generator.MetadataAccess;
++
++// Assemblies live in the RuntimeContext; nothing is ever probed from disk.
++internal sealed class Il2CppAssemblyResolver : AssemblyResolverBase
++{
++    public Il2CppAssemblyResolver() : base(new ModuleReaderParameters(new ByteArrayFileService()))
++    {
++    }
++
++    public override string? ProbeAssemblyFilePath(AssemblyDescriptor assembly, ModuleDefinition? originModule) => null;
++
++    public static RuntimeContext NewContext(AssemblyDescriptor? corLib = null)
++        => new(DotNetRuntimeInfo.NetCoreApp(6, 0), new Il2CppAssemblyResolver(), corLib);
++}
+diff --git a/Il2CppInterop.Generator/Passes/Pass20GenerateStaticConstructors.cs b/Il2CppInterop.Generator/Passes/Pass20GenerateStaticConstructors.cs
+index f71c60a..77cfd19 100644
+--- a/Il2CppInterop.Generator/Passes/Pass20GenerateStaticConstructors.cs
++++ b/Il2CppInterop.Generator/Passes/Pass20GenerateStaticConstructors.cs
+@@ -59,7 +59,7 @@ public static class Pass20GenerateStaticConstructors
+ 
+             ctorBuilder.Add(OpCodes.Call, assemblyContext.Imports.IL2CPP_il2cpp_class_get_type.Value);
+             ctorBuilder.Add(OpCodes.Call,
+-                new MemberReference(il2CppSystemTypeRef, "internal_from_handle", MethodSignature.CreateStatic(il2CppSystemTypeRef.ToTypeSignature(), assemblyContext.Imports.Module.IntPtr())));
++                new MemberReference(il2CppSystemTypeRef, "internal_from_handle", Sigs.Static(il2CppSystemTypeRef.ToTypeSignature(), assemblyContext.Imports.Module.IntPtr())));
+ 
+             ctorBuilder.Add(OpCodes.Ldc_I4, oldType.GenericParameters.Count);
+ 
+@@ -79,13 +79,13 @@ public static class Pass20GenerateStaticConstructors
+                 ctorBuilder.Add(OpCodes.Call, assemblyContext.Imports.IL2CPP_il2cpp_class_get_type.Value);
+ 
+                 ctorBuilder.Add(OpCodes.Call,
+-                    new MemberReference(il2CppSystemTypeRef, "internal_from_handle", MethodSignature.CreateStatic(il2CppSystemTypeRef.ToTypeSignature(), assemblyContext.Imports.Module.IntPtr())));
++                    new MemberReference(il2CppSystemTypeRef, "internal_from_handle", Sigs.Static(il2CppSystemTypeRef.ToTypeSignature(), assemblyContext.Imports.Module.IntPtr())));
+                 ctorBuilder.Add(OpCodes.Stelem_Ref);
+             }
+ 
+             var il2CppTypeArray = assemblyContext.Imports.Il2CppReferenceArray.MakeGenericInstanceType(il2CppSystemTypeRef.ToTypeSignature());
+             ctorBuilder.Add(OpCodes.Newobj,
+-                new MemberReference(il2CppTypeArray.ToTypeDefOrRef(), ".ctor", MethodSignature.CreateInstance(assemblyContext.Imports.Module.Void(), new GenericParameterSignature(GenericParameterType.Type, 0).MakeSzArrayType())));
++                new MemberReference(il2CppTypeArray.ToTypeDefOrRef(), ".ctor", Sigs.Instance(assemblyContext.Imports.Module.Void(), new GenericParameterSignature(GenericParameterType.Type, 0).MakeSzArrayType())));
+             ctorBuilder.Add(OpCodes.Call,
+                 ReferenceCreator.CreateInstanceMethodReference(nameof(Type.MakeGenericType), il2CppSystemTypeRef.ToTypeSignature(), il2CppSystemTypeRef, il2CppTypeArray));
+ 
+diff --git a/Il2CppInterop.Generator/Passes/Pass23GeneratePointerConstructors.cs b/Il2CppInterop.Generator/Passes/Pass23GeneratePointerConstructors.cs
+index a71dba0..b4c2e10 100644
+--- a/Il2CppInterop.Generator/Passes/Pass23GeneratePointerConstructors.cs
++++ b/Il2CppInterop.Generator/Passes/Pass23GeneratePointerConstructors.cs
+@@ -21,7 +21,7 @@ public static class Pass23GeneratePointerConstructors
+ 
+                 var nativeCtor = new MethodDefinition(".ctor",
+                     MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.RuntimeSpecialName |
+-                    MethodAttributes.HideBySig, MethodSignature.CreateInstance(assemblyContext.Imports.Module.Void()));
++                    MethodAttributes.HideBySig, Sigs.Instance(assemblyContext.Imports.Module.Void()));
+ 
+                 nativeCtor.AddParameter(assemblyContext.Imports.Module.IntPtr(), "pointer");
+ 
+@@ -32,7 +32,7 @@ public static class Pass23GeneratePointerConstructors
+                 ctorBody.Add(OpCodes.Ldarg_0);
+                 ctorBody.Add(OpCodes.Ldarg_1);
+                 ctorBody.Add(OpCodes.Call,
+-                    new MemberReference(newType.BaseType, ".ctor", MethodSignature.CreateInstance(assemblyContext.Imports.Module.Void(), assemblyContext.Imports.Module.IntPtr())));
++                    new MemberReference(newType.BaseType, ".ctor", Sigs.Instance(assemblyContext.Imports.Module.Void(), assemblyContext.Imports.Module.IntPtr())));
+                 ctorBody.Add(OpCodes.Ret);
+             }
+     }
+diff --git a/Il2CppInterop.Generator/Passes/Pass25GenerateNonBlittableValueTypeDefaultCtors.cs b/Il2CppInterop.Generator/Passes/Pass25GenerateNonBlittableValueTypeDefaultCtors.cs
+index 1dbbf53..9011665 100644
+--- a/Il2CppInterop.Generator/Passes/Pass25GenerateNonBlittableValueTypeDefaultCtors.cs
++++ b/Il2CppInterop.Generator/Passes/Pass25GenerateNonBlittableValueTypeDefaultCtors.cs
+@@ -18,7 +18,7 @@ public static class Pass25GenerateNonBlittableValueTypeDefaultCtors
+ 
+                 var emptyCtor = new MethodDefinition(".ctor",
+                     MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.RuntimeSpecialName |
+-                    MethodAttributes.HideBySig, MethodSignature.CreateInstance(assemblyContext.Imports.Module.Void()));
++                    MethodAttributes.HideBySig, Sigs.Instance(assemblyContext.Imports.Module.Void()));
+ 
+                 typeContext.NewType.Methods.Add(emptyCtor);
+ 
+@@ -31,7 +31,7 @@ public static class Pass25GenerateNonBlittableValueTypeDefaultCtors
+                 bodyBuilder.Add(OpCodes.Ldsfld, typeContext.ClassPointerFieldRef);
+                 bodyBuilder.Add(OpCodes.Call, assemblyContext.Imports.IL2CPP_il2cpp_object_new.Value);
+                 bodyBuilder.Add(OpCodes.Call,
+-                    new MemberReference(typeContext.NewType.BaseType, ".ctor", MethodSignature.CreateInstance(assemblyContext.Imports.Module.Void(), assemblyContext.Imports.Module.IntPtr())));
++                    new MemberReference(typeContext.NewType.BaseType, ".ctor", Sigs.Instance(assemblyContext.Imports.Module.Void(), assemblyContext.Imports.Module.IntPtr())));
+                 bodyBuilder.Add(OpCodes.Ret);
+             }
+     }
+diff --git a/Il2CppInterop.Generator/Passes/Pass30GenerateGenericMethodStoreConstructors.cs b/Il2CppInterop.Generator/Passes/Pass30GenerateGenericMethodStoreConstructors.cs
+index 57a589b..967e0df 100644
+--- a/Il2CppInterop.Generator/Passes/Pass30GenerateGenericMethodStoreConstructors.cs
++++ b/Il2CppInterop.Generator/Passes/Pass30GenerateGenericMethodStoreConstructors.cs
+@@ -42,7 +42,7 @@ public static class Pass30GenerateGenericMethodStoreConstructors
+                         ctorBuilder.Add(OpCodes.Call, assemblyContext.Imports.IL2CPP_il2cpp_method_get_object.Value);
+                         ctorBuilder.Add(OpCodes.Newobj,
+                             new MemberReference(il2CppSystemReflectionMethodInfoRef, ".ctor",
+-                                MethodSignature.CreateInstance(assemblyContext.Imports.Module.Void(), assemblyContext.Imports.Module.IntPtr())));
++                                Sigs.Instance(assemblyContext.Imports.Module.Void(), assemblyContext.Imports.Module.IntPtr())));
+ 
+                         ctorBuilder.Add(OpCodes.Ldc_I4, oldMethod.GenericParameters.Count);
+ 
+@@ -65,7 +65,7 @@ public static class Pass30GenerateGenericMethodStoreConstructors
+ 
+                             ctorBuilder.Add(OpCodes.Call,
+                                 new MemberReference(il2CppSystemTypeRef, "internal_from_handle",
+-                                MethodSignature.CreateStatic(il2CppSystemTypeRef.ToTypeSignature(), assemblyContext.Imports.Module.IntPtr())));
++                                Sigs.Static(il2CppSystemTypeRef.ToTypeSignature(), assemblyContext.Imports.Module.IntPtr())));
+                             ctorBuilder.Add(OpCodes.Stelem_Ref);
+                         }
+ 
+diff --git a/Il2CppInterop.Generator/Passes/Pass60AddImplicitConversions.cs b/Il2CppInterop.Generator/Passes/Pass60AddImplicitConversions.cs
+index 500fbc2..54c5034 100644
+--- a/Il2CppInterop.Generator/Passes/Pass60AddImplicitConversions.cs
++++ b/Il2CppInterop.Generator/Passes/Pass60AddImplicitConversions.cs
+@@ -20,7 +20,7 @@ public static class Pass60AddImplicitConversions
+         var objectTypeContext = assemblyContext.GetTypeByName("System.Object");
+ 
+         var methodFromMonoString = new MethodDefinition("op_Implicit", OperatorAttributes,
+-            MethodSignature.CreateStatic(typeContext.NewType.ToTypeSignature(), assemblyContext.Imports.Module.String()));
++            Sigs.Static(typeContext.NewType.ToTypeSignature(), assemblyContext.Imports.Module.String()));
+         typeContext.NewType.Methods.Add(methodFromMonoString);
+         methodFromMonoString.CilMethodBody = new CilMethodBody();
+         var fromBuilder = methodFromMonoString.CilMethodBody.Instructions;
+@@ -39,7 +39,7 @@ public static class Pass60AddImplicitConversions
+             ReferenceCreator.CreateInstanceMethodReference(".ctor", assemblyContext.Imports.Module.Void(), typeContext.NewType, assemblyContext.Imports.Module.IntPtr()));
+         fromBuilder.Add(OpCodes.Ret);
+ 
+-        var methodToObject = new MethodDefinition("op_Implicit", OperatorAttributes, MethodSignature.CreateStatic(objectTypeContext.NewType.ToTypeSignature()));
++        var methodToObject = new MethodDefinition("op_Implicit", OperatorAttributes, Sigs.Static(objectTypeContext.NewType.ToTypeSignature()));
+         methodToObject.AddParameter(assemblyContext.Imports.Module.String());
+         objectTypeContext.NewType.Methods.Add(methodToObject);
+         methodToObject.CilMethodBody = new CilMethodBody();
+@@ -48,7 +48,7 @@ public static class Pass60AddImplicitConversions
+         toObjectBuilder.Add(OpCodes.Call, methodFromMonoString);
+         toObjectBuilder.Add(OpCodes.Ret);
+ 
+-        var methodToMonoString = new MethodDefinition("op_Implicit", OperatorAttributes, MethodSignature.CreateStatic(assemblyContext.Imports.Module.String()));
++        var methodToMonoString = new MethodDefinition("op_Implicit", OperatorAttributes, Sigs.Static(assemblyContext.Imports.Module.String()));
+         methodToMonoString.AddParameter(typeContext.NewType.ToTypeSignature());
+         typeContext.NewType.Methods.Add(methodToMonoString);
+         methodToMonoString.CilMethodBody = new CilMethodBody();
+@@ -95,7 +95,7 @@ public static class Pass60AddImplicitConversions
+         {
+             var il2CppSystemType = assemblyContext.GetTypeByName(systemType.FullName).NewType;
+ 
+-            var method = new MethodDefinition("op_Implicit", OperatorAttributes, MethodSignature.CreateStatic(objectTypeContext.NewType.ToTypeSignature()));
++            var method = new MethodDefinition("op_Implicit", OperatorAttributes, Sigs.Static(objectTypeContext.NewType.ToTypeSignature()));
+             method.AddParameter(systemType, "value");
+ 
+             method.CilMethodBody = new CilMethodBody();
+@@ -136,7 +136,7 @@ public static class Pass60AddImplicitConversions
+                 if (invokeMethod.Parameters.Any(it => it.ParameterType is PointerTypeSignature or ByReferenceTypeSignature))
+                     continue;
+ 
+-                var implicitMethod = new MethodDefinition("op_Implicit", OperatorAttributes, MethodSignature.CreateStatic(typeContext.SelfSubstitutedRef.ToTypeSignature()));
++                var implicitMethod = new MethodDefinition("op_Implicit", OperatorAttributes, Sigs.Static(typeContext.SelfSubstitutedRef.ToTypeSignature()));
+                 typeContext.NewType.Methods.Add(implicitMethod);
+                 implicitMethod.CilMethodBody = new CilMethodBody();
+ 
+@@ -154,14 +154,14 @@ public static class Pass60AddImplicitConversions
+                 GenericInstanceTypeSignature? genericInstanceType = null;
+                 if (hasParameters)
+                 {
+-                    genericInstanceType = new GenericInstanceTypeSignature(monoDelegateType.ToTypeDefOrRef(), false);
++                    genericInstanceType = Sigs.GenericInst(monoDelegateType.ToTypeDefOrRef(), false);
+                     foreach (var t in invokeMethod.Parameters)
+                         genericInstanceType.TypeArguments.Add(t.ParameterType);
+                 }
+ 
+                 if (hasReturn)
+                 {
+-                    genericInstanceType ??= new GenericInstanceTypeSignature(monoDelegateType.ToTypeDefOrRef(), false);
++                    genericInstanceType ??= Sigs.GenericInst(monoDelegateType.ToTypeDefOrRef(), false);
+                     genericInstanceType.TypeArguments.Add(invokeMethod.Signature.ReturnType);
+                 }
+ 
+@@ -173,14 +173,14 @@ public static class Pass60AddImplicitConversions
+ 
+                 bodyBuilder.Add(OpCodes.Ldarg_0);
+                 var delegateSupportTypeRef = typeContext.AssemblyContext.Imports.DelegateSupport;
+-                var genericConvertSignature = MethodSignature.CreateStatic(new GenericParameterSignature(GenericParameterType.Method, 0), 1, assemblyContext.Imports.Module.Delegate());
++                var genericConvertSignature = Sigs.Static(new GenericParameterSignature(GenericParameterType.Method, 0), 1, assemblyContext.Imports.Module.Delegate());
+                 var genericConvertRef = new MemberReference(delegateSupportTypeRef.ToTypeDefOrRef(), "ConvertDelegate", genericConvertSignature);
+                 var convertMethodRef = genericConvertRef.MakeGenericInstanceMethod(typeContext.SelfSubstitutedRef.ToTypeSignature());
+                 bodyBuilder.Add(OpCodes.Call, typeContext.NewType.DeclaringModule!.DefaultImporter.ImportMethod(convertMethodRef));
+                 bodyBuilder.Add(OpCodes.Ret);
+ 
+                 // public static T operator+(T lhs, T rhs) => Il2CppSystem.Delegate.Combine(lhs, rhs).Cast<T>();
+-                var addMethod = new MethodDefinition("op_Addition", OperatorAttributes, MethodSignature.CreateStatic(typeContext.SelfSubstitutedRef.ToTypeSignature()));
++                var addMethod = new MethodDefinition("op_Addition", OperatorAttributes, Sigs.Static(typeContext.SelfSubstitutedRef.ToTypeSignature()));
+                 typeContext.NewType.Methods.Add(addMethod);
+                 addMethod.AddParameter(typeContext.SelfSubstitutedRef.ToTypeSignature());
+                 addMethod.AddParameter(typeContext.SelfSubstitutedRef.ToTypeSignature());
+@@ -194,7 +194,7 @@ public static class Pass60AddImplicitConversions
+                 addBody.Add(OpCodes.Ret);
+ 
+                 // public static T operator-(T lhs, T rhs) => Il2CppSystem.Delegate.Remove(lhs, rhs)?.Cast<T>();
+-                var subtractMethod = new MethodDefinition("op_Subtraction", OperatorAttributes, MethodSignature.CreateStatic(typeContext.SelfSubstitutedRef.ToTypeSignature()));
++                var subtractMethod = new MethodDefinition("op_Subtraction", OperatorAttributes, Sigs.Static(typeContext.SelfSubstitutedRef.ToTypeSignature()));
+                 typeContext.NewType.Methods.Add(subtractMethod);
+                 subtractMethod.AddParameter(typeContext.SelfSubstitutedRef.ToTypeSignature());
+                 subtractMethod.AddParameter(typeContext.SelfSubstitutedRef.ToTypeSignature());
+diff --git a/Il2CppInterop.Generator/Passes/Pass61ImplementAwaiters.cs b/Il2CppInterop.Generator/Passes/Pass61ImplementAwaiters.cs
+index 9ed14fa..6567bef 100644
+--- a/Il2CppInterop.Generator/Passes/Pass61ImplementAwaiters.cs
++++ b/Il2CppInterop.Generator/Passes/Pass61ImplementAwaiters.cs
+@@ -1,4 +1,4 @@
+-﻿using System.Runtime.CompilerServices;
++using System.Runtime.CompilerServices;
+ using AsmResolver.DotNet;
+ using AsmResolver.DotNet.Cloning;
+ using AsmResolver.DotNet.Signatures;
+@@ -55,7 +55,7 @@ public static class Pass61ImplementAwaiters
+                 }
+ 
+                 var onCompletedAttr = MethodAttributes.Public | MethodAttributes.Final | MethodAttributes.HideBySig | MethodAttributes.NewSlot | MethodAttributes.Virtual;
+-                var sig = MethodSignature.CreateInstance(voidRef, [actionUntypedRef.Value.ToTypeSignature()]);
++                var sig = Sigs.Instance(voidRef, [actionUntypedRef.Value.ToTypeSignature()]);
+ 
+                 var proxyOnCompleted = new MethodDefinition(nameof(INotifyCompletion.OnCompleted), onCompletedAttr, sig);
+                 var parameter = proxyOnCompleted.Parameters[0].GetOrCreateDefinition();
+diff --git a/Il2CppInterop.Generator/Passes/Pass80UnstripMethods.cs b/Il2CppInterop.Generator/Passes/Pass80UnstripMethods.cs
+index 04a285b..2e75cc4 100644
+--- a/Il2CppInterop.Generator/Passes/Pass80UnstripMethods.cs
++++ b/Il2CppInterop.Generator/Passes/Pass80UnstripMethods.cs
+@@ -206,7 +206,7 @@ public static class Pass80UnstripMethods
+                 { IsValueType: true } => imports.Il2CppStructArray,
+                 _ => imports.Il2CppReferenceArray
+             };
+-            return new GenericInstanceTypeSignature(genericBase.ToTypeDefOrRef(), false, resolvedElementType);
++            return Sigs.GenericInst(genericBase.ToTypeDefOrRef(), false, resolvedElementType);
+         }
+ 
+         if (unityType is PointerTypeSignature)
+@@ -234,7 +234,7 @@ public static class Pass80UnstripMethods
+         {
+             var baseRef = ResolveTypeInNewAssembliesRaw(context, genericInstance.GenericType.ToTypeSignature(), imports);
+             if (baseRef == null) return null;
+-            var newInstance = new GenericInstanceTypeSignature(baseRef.ToTypeDefOrRef(), baseRef.IsValueType());
++            var newInstance = Sigs.GenericInst(baseRef.ToTypeDefOrRef(), baseRef.IsValueType());
+             foreach (var unityGenericArgument in genericInstance.TypeArguments)
+             {
+                 var resolvedArgument = ResolveTypeInNewAssemblies(context, unityGenericArgument, imports);
+diff --git a/Il2CppInterop.Generator/Utils/CorlibReferences.cs b/Il2CppInterop.Generator/Utils/CorlibReferences.cs
+index cf341c0..beb3e22 100644
+--- a/Il2CppInterop.Generator/Utils/CorlibReferences.cs
++++ b/Il2CppInterop.Generator/Utils/CorlibReferences.cs
+@@ -206,26 +206,26 @@ internal static class CorlibReferences
+     public static MemberReference TypeGetTypeFromHandle(this ModuleDefinition module)
+     {
+         var type = module.Type();
+-        MethodSignature signature = MethodSignature.CreateStatic(type, module.RuntimeTypeHandle());
++        MethodSignature signature = Sigs.Static(type, module.RuntimeTypeHandle());
+         return new MemberReference(type.ToTypeDefOrRef(), nameof(System.Type.GetTypeFromHandle), signature);
+     }
+ 
+     public static MemberReference TypeGetIsValueType(this ModuleDefinition module)
+     {
+         var type = module.Type();
+-        return new MemberReference(type.ToTypeDefOrRef(), "get_IsValueType", MethodSignature.CreateInstance(module.Bool()));
++        return new MemberReference(type.ToTypeDefOrRef(), "get_IsValueType", Sigs.Instance(module.Bool()));
+     }
+ 
+     public static MemberReference TypeGetFullName(this ModuleDefinition module)
+     {
+         var type = module.Type();
+-        return new MemberReference(type.ToTypeDefOrRef(), "get_FullName", MethodSignature.CreateInstance(module.String()));
++        return new MemberReference(type.ToTypeDefOrRef(), "get_FullName", Sigs.Instance(module.String()));
+     }
+ 
+     public static MemberReference StringEquals(this ModuleDefinition module)
+     {
+         var @string = module.String();
+-        MethodSignature signature = MethodSignature.CreateStatic(module.Bool(), @string, @string);
++        MethodSignature signature = Sigs.Static(module.Bool(), @string, @string);
+         return new MemberReference(@string.ToTypeDefOrRef(), nameof(string.Equals), signature);
+     }
+ 
+@@ -256,7 +256,7 @@ internal static class CorlibReferences
+ 
+     private static MemberReference MakeConstructorReference(ModuleDefinition module, ITypeDefOrRef type, params TypeSignature[] parameters)
+     {
+-        MethodSignature signature = MethodSignature.CreateInstance(module.Void(), parameters);
++        MethodSignature signature = Sigs.Instance(module.Void(), parameters);
+         return new MemberReference(type, ".ctor", signature);
+     }
+ }
+diff --git a/Il2CppInterop.Generator/Utils/MethodSignatureCreator.cs b/Il2CppInterop.Generator/Utils/MethodSignatureCreator.cs
+index 023ca43..3386a67 100644
+--- a/Il2CppInterop.Generator/Utils/MethodSignatureCreator.cs
++++ b/Il2CppInterop.Generator/Utils/MethodSignatureCreator.cs
+@@ -1,4 +1,4 @@
+-﻿using AsmResolver.DotNet.Signatures;
++using AsmResolver.DotNet.Signatures;
+ using AsmResolver.PE.DotNet.Metadata.Tables;
+ 
+ namespace Il2CppInterop.Generator.Utils;
+@@ -12,6 +12,6 @@ internal static class MethodSignatureCreator
+ 
+     public static MethodSignature CreateMethodSignature(bool isStatic, TypeSignature returnType, int genericParameterCount, params TypeSignature[] parameterTypes)
+     {
+-        return isStatic ? MethodSignature.CreateStatic(returnType, genericParameterCount, parameterTypes) : MethodSignature.CreateInstance(returnType, genericParameterCount, parameterTypes);
++        return isStatic ? Sigs.Static(returnType, genericParameterCount, parameterTypes) : Sigs.Instance(returnType, genericParameterCount, parameterTypes);
+     }
+ }
+diff --git a/Il2CppInterop.Generator/Utils/ReferenceCreator.cs b/Il2CppInterop.Generator/Utils/ReferenceCreator.cs
+index b9272be..96d509d 100644
+--- a/Il2CppInterop.Generator/Utils/ReferenceCreator.cs
++++ b/Il2CppInterop.Generator/Utils/ReferenceCreator.cs
+@@ -1,4 +1,4 @@
+-﻿using AsmResolver;
++using AsmResolver;
+ using AsmResolver.DotNet;
+ using AsmResolver.DotNet.Signatures;
+ 
+@@ -12,11 +12,11 @@ internal static class ReferenceCreator
+ 
+     public static MemberReference CreateInstanceMethodReference(Utf8String? name, TypeSignature returnType, IMemberRefParent? parent, params TypeSignature[] parameterTypes)
+     {
+-        return new MemberReference(parent, name, MethodSignature.CreateInstance(returnType, parameterTypes));
++        return new MemberReference(parent, name, Sigs.Instance(returnType, parameterTypes));
+     }
+ 
+     public static MemberReference CreateStaticMethodReference(Utf8String? name, TypeSignature returnType, IMemberRefParent? parent, params TypeSignature[] parameterTypes)
+     {
+-        return new MemberReference(parent, name, MethodSignature.CreateStatic(returnType, parameterTypes));
++        return new MemberReference(parent, name, Sigs.Static(returnType, parameterTypes));
+     }
+ }
+diff --git a/Il2CppInterop.Generator/Utils/RuntimeAssemblyReferences.cs b/Il2CppInterop.Generator/Utils/RuntimeAssemblyReferences.cs
+index fbdfc20..bde163c 100644
+--- a/Il2CppInterop.Generator/Utils/RuntimeAssemblyReferences.cs
++++ b/Il2CppInterop.Generator/Utils/RuntimeAssemblyReferences.cs
+@@ -1,4 +1,4 @@
+-﻿// ReSharper disable InconsistentNaming
++// ReSharper disable InconsistentNaming
+ 
+ using AsmResolver.DotNet;
+ using AsmResolver.DotNet.Signatures;
+@@ -173,7 +173,7 @@ public class RuntimeAssemblyReferences
+         {
+             var owner = ResolveType("Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<T>");
+             var gp = new GenericParameterSignature(GenericParameterType.Type, 0);
+-            var giOwner = new GenericInstanceTypeSignature(owner.ToTypeDefOrRef(), false);
++            var giOwner = Sigs.GenericInst(owner.ToTypeDefOrRef(), false);
+             giOwner.TypeArguments.Add(param);
+             var mr = ReferenceCreator.CreateInstanceMethodReference(".ctor", ResolveType("System.Void"),
+                 giOwner.ToTypeDefOrRef());
+@@ -185,7 +185,7 @@ public class RuntimeAssemblyReferences
+         Il2CppRefrenceArrayctor_size = new((param) =>
+         {
+             var owner = ResolveType("Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<T>");
+-            var giOwner = new GenericInstanceTypeSignature(owner.ToTypeDefOrRef(), false);
++            var giOwner = Sigs.GenericInst(owner.ToTypeDefOrRef(), false);
+             giOwner.TypeArguments.Add(param);
+             var mr = ReferenceCreator.CreateInstanceMethodReference(".ctor", ResolveType("System.Void"),
+                     giOwner.ToTypeDefOrRef(), ResolveType("System.Int64"));
+@@ -266,7 +266,7 @@ public class RuntimeAssemblyReferences
+         Il2CppObjectBase_Cast = new Lazy<IMethodDefOrRef>(() =>
+         {
+             var gp0 = new GenericParameterSignature(GenericParameterType.Method, 0);
+-            var signature = MethodSignature.CreateInstance(gp0, 1);
++            var signature = Sigs.Instance(gp0, 1);
+             var mr = new MemberReference(ResolveType("Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase").ToTypeDefOrRef(), "Cast", signature);
+             return mr;
+         });
+@@ -274,7 +274,7 @@ public class RuntimeAssemblyReferences
+         Il2CppObjectBase_TryCast = new Lazy<IMethodDefOrRef>(() =>
+         {
+             var gp0 = new GenericParameterSignature(GenericParameterType.Method, 0);
+-            var signature = MethodSignature.CreateInstance(gp0, 1);
++            var signature = Sigs.Instance(gp0, 1);
+             var mr = new MemberReference(ResolveType("Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase").ToTypeDefOrRef(), "TryCast", signature);
+             return mr;
+         });
+@@ -282,7 +282,7 @@ public class RuntimeAssemblyReferences
+         Il2CppObjectPool_Get = new Lazy<IMethodDefOrRef>(() =>
+         {
+             var gp0 = new GenericParameterSignature(GenericParameterType.Method, 0);
+-            var signature = MethodSignature.CreateStatic(gp0, 1, ResolveType("System.IntPtr"));
++            var signature = Sigs.Static(gp0, 1, ResolveType("System.IntPtr"));
+             var mr = new MemberReference(ResolveType("Il2CppInterop.Runtime.Runtime.Il2CppObjectPool").ToTypeDefOrRef(), "Get", signature);
+             return mr;
+         });
+@@ -290,7 +290,7 @@ public class RuntimeAssemblyReferences
+         IL2CPP_ResolveICall = new Lazy<IMethodDefOrRef>(() =>
+         {
+             var gp0 = new GenericParameterSignature(GenericParameterType.Method, 0);
+-            var signature = MethodSignature.CreateStatic(gp0, 1, ResolveType("System.String"));
++            var signature = Sigs.Static(gp0, 1, ResolveType("System.String"));
+             var mr = new MemberReference(ResolveType("Il2CppInterop.Runtime.IL2CPP").ToTypeDefOrRef(), "ResolveICall", signature);
+             return mr;
+         });
+@@ -467,7 +467,7 @@ public class RuntimeAssemblyReferences
+         IL2CPP_PointerToValueGeneric = new Lazy<IMethodDefOrRef>(() =>
+         {
+             var gp0 = new GenericParameterSignature(GenericParameterType.Method, 0);
+-            var signature = MethodSignature.CreateStatic(gp0, 1, ResolveType("System.IntPtr"), ResolveType("System.Boolean"), ResolveType("System.Boolean"));
++            var signature = Sigs.Static(gp0, 1, ResolveType("System.IntPtr"), ResolveType("System.Boolean"), ResolveType("System.Boolean"));
+             var mr = new MemberReference(ResolveType("Il2CppInterop.Runtime.IL2CPP").ToTypeDefOrRef(), "PointerToValueGeneric", signature);
+             return mr;
+         });
+@@ -475,7 +475,7 @@ public class RuntimeAssemblyReferences
+         IL2CPP_RenderTypeName = new Lazy<IMethodDefOrRef>(() =>
+         {
+             var gp0 = new GenericParameterSignature(GenericParameterType.Method, 0);
+-            var signature = MethodSignature.CreateStatic(ResolveType("System.String"), 1, ResolveType("System.Boolean"));
++            var signature = Sigs.Static(ResolveType("System.String"), 1, ResolveType("System.Boolean"));
+             var mr = new MemberReference(ResolveType("Il2CppInterop.Runtime.IL2CPP").ToTypeDefOrRef(), "RenderTypeName", signature);
+             return mr;
+         });
+@@ -508,7 +508,7 @@ public class RuntimeAssemblyReferences
+             var declaringTypeRef = RuntimeReflectionHelper;
+             var returnTypeRef = Module.DefaultImporter.ImportType(globalCtx.GetAssemblyByName("mscorlib").NewAssembly.ManifestModule!
+                 .GetType("Il2CppSystem.RuntimeTypeHandle"));
+-            var signature = MethodSignature.CreateStatic(returnTypeRef.ToTypeSignature(), 1);
++            var signature = Sigs.Static(returnTypeRef.ToTypeSignature(), 1);
+             var methodReference = new MemberReference(declaringTypeRef.ToTypeDefOrRef(), "GetRuntimeTypeHandle", signature);
+             return Module.DefaultImporter.ImportMethod(methodReference);
+         });
+diff --git a/Il2CppInterop.Generator/Utils/UnstripGenerator.cs b/Il2CppInterop.Generator/Utils/UnstripGenerator.cs
+index 2b7fb54..a8d8e7f 100644
+--- a/Il2CppInterop.Generator/Utils/UnstripGenerator.cs
++++ b/Il2CppInterop.Generator/Utils/UnstripGenerator.cs
+@@ -20,13 +20,13 @@ public static class UnstripGenerator
+ 
+         var constructor = new MethodDefinition(".ctor",
+             MethodAttributes.HideBySig | MethodAttributes.SpecialName | MethodAttributes.RuntimeSpecialName |
+-            MethodAttributes.Public, MethodSignature.CreateInstance(imports.Module.Void(), imports.Module.Object(), imports.Module.IntPtr()));
++            MethodAttributes.Public, Sigs.Instance(imports.Module.Void(), imports.Module.Object(), imports.Module.IntPtr()));
+         constructor.ImplAttributes = MethodImplAttributes.CodeTypeMask;
+         delegateType.Methods.Add(constructor);
+ 
+         var invokeMethod = new MethodDefinition("Invoke",
+             MethodAttributes.HideBySig | MethodAttributes.Virtual | MethodAttributes.NewSlot | MethodAttributes.Public,
+-            MethodSignature.CreateInstance(imports.Module.Void())); // todo
++            Sigs.Instance(imports.Module.Void())); // todo
+         invokeMethod.ImplAttributes = MethodImplAttributes.CodeTypeMask;
+         delegateType.Methods.Add(invokeMethod);
+ 
+diff --git a/Il2CppInterop.Generator/Utils/UnstripTranslator.cs b/Il2CppInterop.Generator/Utils/UnstripTranslator.cs
+index a65934b..7657da2 100644
+--- a/Il2CppInterop.Generator/Utils/UnstripTranslator.cs
++++ b/Il2CppInterop.Generator/Utils/UnstripTranslator.cs
+@@ -212,8 +212,8 @@ public static class UnstripTranslator
+                     return false;
+ 
+                 var newMethodSignature = methodArg.Signature!.HasThis
+-                    ? MethodSignature.CreateInstance(newReturnType, methodArg.Signature.GenericParameterCount)
+-                    : MethodSignature.CreateStatic(newReturnType, methodArg.Signature.GenericParameterCount);
++                    ? Sigs.Instance(newReturnType, methodArg.Signature.GenericParameterCount)
++                    : Sigs.Static(newReturnType, methodArg.Signature.GenericParameterCount);
+                 foreach (var methodArgParameter in methodArg.Signature.ParameterTypes)
+                 {
+                     var newParamType = Pass80UnstripMethods.ResolveTypeInNewAssemblies(globalContext,
+-- 
+2.50.1.windows.1
+

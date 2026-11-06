@@ -1,0 +1,160 @@
+From 15fdbde670a557d3ab66ba49c8129f19e3a08551 Mon Sep 17 00:00:00 2001
+From: Andrew Hartwig <andrew.hartwig1@gmail.com>
+Date: Fri, 6 Nov 2026 12:59:32 -0500
+Subject: [PATCH 2/3] Build a Moon Sweepers pack against the Il2CppInterop v108
+ branch
+
+---
+ MOONSWEEPERS-PACK.md                          | 20 ++++
+ .../BepInEx.Unity.IL2CPP.csproj               |  6 +-
+ build-moonsweepers-pack.ps1                   | 93 +++++++++++++++++++
+ 3 files changed, 116 insertions(+), 3 deletions(-)
+ create mode 100644 MOONSWEEPERS-PACK.md
+ create mode 100644 build-moonsweepers-pack.ps1
+
+diff --git a/MOONSWEEPERS-PACK.md b/MOONSWEEPERS-PACK.md
+new file mode 100644
+index 0000000..ddcd8c7
+--- /dev/null
++++ b/MOONSWEEPERS-PACK.md
+@@ -0,0 +1,20 @@
++# BepInEx pack for Moon Sweepers
++
++An unofficial build of BepInEx 6 IL2CPP for Moon Sweepers (Unity 6000.6, IL2CPP metadata v108), which stock BepInEx
++can't load yet. It's meant as the shared dependency for Moon Sweepers mods until official BepInEx builds support the
++game, and it isn't made by or supported by the BepInEx team.
++
++Install it, then launch the game once. The first launch generates the interop assemblies, which takes a few minutes.
++Close any other mod loader first, and remove ModEngine if you have it installed.
++
++## Status
++
++Test build. It has been tested in single player on Windows. Multiplayer, Linux and other Unity games are untested.
++
++## Source
++
++- BepInEx: <https://github.com/Andrew1431/BepInEx/tree/moonsweepers-pack> (LGPL-2.1)
++- Il2CppInterop: <https://github.com/Andrew1431/Il2CppInterop/tree/v108> (LGPL-3.0)
++
++Licence texts are in the `licenses` folder. To rebuild the pack from source, run `build-moonsweepers-pack.ps1` from the
++BepInEx branch.
+diff --git a/Runtimes/Unity/BepInEx.Unity.IL2CPP/BepInEx.Unity.IL2CPP.csproj b/Runtimes/Unity/BepInEx.Unity.IL2CPP/BepInEx.Unity.IL2CPP.csproj
+index 4cdb5e9..03a7e92 100644
+--- a/Runtimes/Unity/BepInEx.Unity.IL2CPP/BepInEx.Unity.IL2CPP.csproj
++++ b/Runtimes/Unity/BepInEx.Unity.IL2CPP/BepInEx.Unity.IL2CPP.csproj
+@@ -15,10 +15,10 @@
+     <ItemGroup>
+         <PackageReference Include="HarmonyX" Version="2.10.2" />
+         <PackageReference Include="Iced" Version="1.21.0" />
+-        <PackageReference Include="Il2CppInterop.Generator" Version="1.5.3" />
+-        <PackageReference Include="Il2CppInterop.HarmonySupport" Version="1.5.3" />
++        <PackageReference Include="Il2CppInterop.Generator" Version="1.5.3-moonsweepers.1" />
++        <PackageReference Include="Il2CppInterop.HarmonySupport" Version="1.5.3-moonsweepers.1" />
+         <PackageReference Include="Il2CppInterop.ReferenceLibs" Version="1.0.0" IncludeAssets="compile" PrivateAssets="all" />
+-        <PackageReference Include="Il2CppInterop.Runtime" Version="1.5.3" />
++        <PackageReference Include="Il2CppInterop.Runtime" Version="1.5.3-moonsweepers.1" />
+         <PackageReference Include="Microsoft.Extensions.Logging" Version="6.0.0" IncludeAssets="compile" PrivateAssets="all" />
+         <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="6.0.1" IncludeAssets="compile" PrivateAssets="all" />
+         <PackageReference Include="MonoMod.RuntimeDetour" Version="22.7.31.1" />
+diff --git a/build-moonsweepers-pack.ps1 b/build-moonsweepers-pack.ps1
+new file mode 100644
+index 0000000..31f0cca
+--- /dev/null
++++ b/build-moonsweepers-pack.ps1
+@@ -0,0 +1,93 @@
++<#
++Builds the Moon Sweepers BepInEx pack from public source: Il2CppInterop (branch v108) goes into a local NuGet feed,
++BepInEx (branch moonsweepers-pack) builds against it with its normal build, and the win-x64 IL2CPP distribution, which
++takes doorstop, dobby and the .NET runtime from their official releases, is laid out as a Thunderstore package.
++
++Needs git and a .NET SDK that builds net8.0. Run from anywhere; everything happens under -WorkDir.
++#>
++param(
++    [Parameter(Mandatory)][string]$WorkDir,
++    [string]$PackVersion = '0.1.0',
++    [string]$BepInExSource = 'https://github.com/Andrew1431/BepInEx.git',
++    [string]$BepInExBranch = 'moonsweepers-pack',
++    [string]$Il2CppInteropSource = 'https://github.com/Andrew1431/Il2CppInterop.git',
++    [string]$Il2CppInteropBranch = 'v108'
++)
++$ErrorActionPreference = 'Stop'
++$suffix = 'moonsweepers.1'
++
++function Run($exe) {
++    & $exe @args
++    if ($LASTEXITCODE -ne 0) { throw "$exe $args failed with exit code $LASTEXITCODE" }
++}
++
++New-Item -ItemType Directory -Force $WorkDir | Out-Null
++$WorkDir = (Resolve-Path $WorkDir).Path
++$interop = Join-Path $WorkDir 'Il2CppInterop'
++$bepinex = Join-Path $WorkDir 'BepInEx'
++$feed = Join-Path $WorkDir 'feed'
++foreach ($dir in $interop, $bepinex, $feed) { if (Test-Path $dir) { Remove-Item $dir -Recurse -Force } }
++New-Item -ItemType Directory $feed | Out-Null
++
++Run git clone --quiet --branch $Il2CppInteropBranch $Il2CppInteropSource $interop
++Run git clone --quiet --branch $BepInExBranch $BepInExSource $bepinex
++
++# Il2CppInterop's global.json pins SDK 8; any SDK that builds its targets will do here.
++Remove-Item (Join-Path $interop 'global.json') -Force
++foreach ($project in 'Il2CppInterop.Common', 'Il2CppInterop.Generator', 'Il2CppInterop.Runtime', 'Il2CppInterop.HarmonySupport') {
++    Run dotnet build (Join-Path $interop "$project\$project.csproj") -c Release "-p:VersionSuffix=$suffix" '-p:NoWarn=CS1591' '-clp:ErrorsOnly' -nologo
++}
++Get-ChildItem (Join-Path $interop 'bin\NuGet') -Filter '*.nupkg' | Copy-Item -Destination $feed
++
++Push-Location $bepinex
++try {
++    Run dotnet nuget add source $feed --name moonsweepers-local --configfile nuget.config
++    # BepInEx's build tool targets net8.0; let it run on a newer runtime if that's what is installed.
++    $env:DOTNET_ROLL_FORWARD = 'Major'
++    Run dotnet run --project build/Build.csproj -- --target MakeDist
++}
++finally {
++    Remove-Item Env:DOTNET_ROLL_FORWARD -ErrorAction SilentlyContinue
++    Pop-Location
++}
++
++$dist = Join-Path $bepinex 'bin\dist\Unity.IL2CPP-win-x64'
++$package = Join-Path $WorkDir 'package'
++if (Test-Path $package) { Remove-Item $package -Recurse -Force }
++New-Item -ItemType Directory $package | Out-Null
++Copy-Item $dist (Join-Path $package 'BepInExPack') -Recurse
++
++$licenses = Join-Path $package 'licenses'
++New-Item -ItemType Directory $licenses | Out-Null
++Copy-Item (Join-Path $bepinex 'LICENSE') (Join-Path $licenses 'BepInEx-LICENSE.txt')
++Copy-Item (Join-Path $interop 'LICENSE') (Join-Path $licenses 'Il2CppInterop-LICENSE.txt')
++
++$manifest = [ordered]@{
++    name           = 'BepInExPack_MoonSweepers'
++    version_number = $PackVersion
++    website_url    = 'https://github.com/Andrew1431/BepInEx/tree/moonsweepers-pack'
++    description    = 'Unofficial BepInEx 6 IL2CPP pack for Moon Sweepers (Unity 6000.6, metadata v108). Built from public forks until upstream supports the game.'
++    dependencies   = @()
++}
++[IO.File]::WriteAllText((Join-Path $package 'manifest.json'), ($manifest | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
++Copy-Item (Join-Path $bepinex 'MOONSWEEPERS-PACK.md') (Join-Path $package 'README.md')
++
++Add-Type -AssemblyName System.Drawing
++$icon = New-Object Drawing.Bitmap 256, 256
++$canvas = [Drawing.Graphics]::FromImage($icon)
++$canvas.SmoothingMode = 'AntiAlias'
++$canvas.Clear([Drawing.Color]::FromArgb(21, 24, 28))
++$moon = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(205, 204, 196))
++$crater = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(160, 160, 152))
++$canvas.FillEllipse($moon, 38, 38, 180, 180)
++$canvas.FillEllipse($crater, 80, 76, 44, 44)
++$canvas.FillEllipse($crater, 146, 128, 30, 30)
++$canvas.FillEllipse($crater, 92, 158, 22, 22)
++$icon.Save((Join-Path $package 'icon.png'), [Drawing.Imaging.ImageFormat]::Png)
++$moon.Dispose(); $crater.Dispose(); $canvas.Dispose(); $icon.Dispose()
++
++$zip = Join-Path $WorkDir "BepInExPack_MoonSweepers-$PackVersion.zip"
++if (Test-Path $zip) { Remove-Item $zip -Force }
++Add-Type -AssemblyName System.IO.Compression.FileSystem
++[IO.Compression.ZipFile]::CreateFromDirectory($package, $zip)
++"Built $zip"
+-- 
+2.50.1.windows.1
+
